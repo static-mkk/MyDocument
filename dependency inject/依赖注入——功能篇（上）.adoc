@@ -1,0 +1,398 @@
+= 依赖注入
+
+== 为什么需要依赖注入？ 
+
+依赖注入是控制反转设计原则的一种体现，表现为将对象的构造和使用分离，以达成松耦合的目的。这么说或许有点抽象，那么下面给出一个简单的例子。
+
+现有如下接口:
+
+[source,java]
+----
+public interface UploadService {
+  /**
+   * 上传一个文件和附带的元数据。
+   *
+   * @return 只有元数据和文件都被保存成功才返回true，否则返回false
+   */
+
+  boolean upload(MetaData metaData, File file);
+}
+----
+
+如果没有依赖注入，那么该接口的实现一般长下面这样：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  Repository repo = new MongodbRepository();
+
+  Writer writer = new DiskWriter();
+
+  boolean upload(MetaData metaData, File file) {
+    
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+
+这样的实现方式将``MongodbRepository``和``DiskWriter``的创建过程和业务逻辑耦合在了一起，看起来似乎没有蛮大问题，但是当要对``RealUploadService``编写单元测试时问题就爆发了。由于缺少依赖注入，``RealUploadService``对环境形成了强制依赖，想要测试``RealUploadService``就不得不弄一个Mongodb甚至是弄一套完整的环境，这是非常笨重的做法，当然也是我们现在的一个痛点。
+
+正确的方法是用构造器或者Setter将``repo``和``writer``传进来：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  private final Repository repo;
+
+  private final Writer writer;
+
+  public RealUploadService(Repository repo, Writer writer) {
+    this.repo = repo;
+    this.writer = writer;
+  }
+
+  boolean upload(MetaData metaData, File file) {
+    
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+
+或者更直接一点：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  @Inject
+  private final Repository repo;
+
+  @Inject
+  private final Writer writer;
+
+  boolean upload(MetaData metaData, File file) {
+    
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+
+
+上面展示了依赖注入的两种形式（构造器注入、注解注入）。需要注意的是，依赖注入还必须对应IoC容器，否则会出现恐怖的人肉构造：
+
+[source,java]
+----
+  public static void main(String[] args) {
+    Repository repo = new MongodbRepository();
+    Writer writer = new DiskWriter();
+    UploadService uploadService
+        = new RealUploadService(repo, writer);
+    ...
+  }
+----
+
+但Web开发者大多数时候都不需要直接使用IoC容器（直接使用的话就和IoC容器耦合了），而是更倾向于声明式的编程，例如声明一个Controller然后由容器注入各种Service。同时IoC容器更偏向于实现细节，故放在后面来讲。
+
+综上，为了项目的可测试性、可维护性以及灵活性，依赖注入是必须的。放眼世界，每一个开源框架都会着重讲解他们的依赖注入模块，甚至JakartaEE（原JavaEE）都有三个依赖注入相关的标准。这里给出一些额外的阅读资料：
+
+* http://javax-inject.github.io/javax-inject/[JSR-330 Dependency Injection for Java]
+* https://download.oracle.com/otn-pub/jcp/cdi-2-final-spec/cdi-spec.pdf?AuthParam=1582198514_280463d255ef3b70ae1d6fa486685300[JSR-365 Contexts and Dependency Injection for Java 2.0， 以下简称CDI规范]
+* https://docs.spring.io/spring/docs/current/spring-framework-reference/core.html#beans[Spring Core Technologies]
+* https://docs.micronaut.io/latest/guide/index.html#ioc[Mirconaut User Guide]
+* https://github.com/google/guice/wiki/GettingStarted[Guice User Guide]
+
+== 为何要重新造轮子？
+
+如果你大概浏览过上面的资料，那么或许会有一个疑问：既然依赖注入已经有这么多轮子了，我们为什么还要自己造一个？最根本的原因是性能问题。Spring作为JVM技术栈最强大的框架，其生态完整性不容置疑，但是性能确实差到了一定地步（ https://www.techempower.com/benchmarks/#section=data-r18&hw=ph&test=fortune&l=zik0vz-f[Spring占据了此表单倒数十名的半壁江山] ）。Micronaut作为Spring的挑战者，性能确实好上不少，特别是启动速度和内存开销，但是吞吐依然不咋地。而依赖注入作为一个框架的核心技术，都是和框架实现硬绑定在一起的，故从头造一个轮子还是有必要的。
+
+NOTE: CDI规范中IoC容器是可替换的，但是此规范过于复杂，目前也仅有参考实现。
+
+== 先理解Bean的概念
+
+或许大多数人的印象中Bean都是和Spring捆在一起的，但其实Bean不是Spring创造的概念。Bean最早出现于JDK1.1，且Sun对Bean定义了一套完整的规范。其中Sun对Bean本身定义为可重用的组件，这个定义在二十多年后的今天看来显然是不充分的。这里使用CDI中Bean的定义 ：
+
+[quote]
+A bean is a source of contextual objects which define application state and/or logic
+
+从这个定义可以看出，Bean是一种类型，IoC容器负责管理Bean对象和Bean的实例对象。这种说法看起来和Class很像，但是 *Bean和Class不是同一个概念*，且Bean可以比Class含有更多的信息。
+
+== 实现目标
+
+既然要重新造轮子，那么就不得不考虑需要一个什么样的轮子。我们不可能也不需要完整的实现CDI规范，也不需要完整的实现Spring中那么多的用法，而是仅实现一个能满足业务需求的最简单的子集即可。故依赖注入的实现目标大体分为了功能方面和实现方面。
+
+=== 功能方面
+
+在功能方面，二期遵从方式统一、使用简单等原则，保持和主流开源框架相同的使用方式，同时砍掉多余的内容，以求最小化学习成本。在这个设计思想的指导下，功能方面又分为了如下目标：
+
+==== JSR-330规范
+
+JSR-330 规范非常简单，可以说是目前主流的依赖注入使用方式。规范本身不提供实现，仅五个注解和一个接口，所以此处不赘述，自行阅读其 http://javax-inject.github.io/javax-inject/api/index.html[ Java doc ]
+
+==== Scopes（作用域）
+
+作用域的概念可以简单理解为IoC容器实例化Bean的策略，即调用``getBean()``方法时返回之前的实例还是重新实例化一个实例。
+
+作用域大致上可以分为会话（Session）类的和非会话类的，会话类的是指在某一段会话中重用一个Bean的实例，会话结束就销毁。其中会话可以是一个Http请求，一个Http连接等等。而非会话类也有``Singleton``、``ThreadLocal``、``Prototype``等。
+
+
+==== 方法注入
+
+当一个Bean与其依赖作用域不一样的时候，例如向一个``Singleton``中注入``Prototype``，常规的方法是没法保证被注入的Bean每次被使用时都是新的，这时方法注入就是解决这个问题的一个办法。
+
+NOTE: 除了方法注入外，注入``Provider``和手动向IoC容器申请也能解决。
+
+[source,java]
+----
+public abstract class CommandManager {
+
+    public Object process(Object commandState) {       
+        Command command = createCommand(); // <1>
+        
+        command.setState(commandState);
+        return command.execute();
+    }
+
+    protected abstract Command createCommand(); // <2>
+}
+----
+<1> 产生一个新的实例
+<2> 自动生成实现方法
+
+==== 部分注入
+
+如果我想创建一个实例，一部分参数来自IoC容器，一部分参数我自己传进去，例如
+
+[source,java]
+----
+public class ServiceImpl implements Service {
+  @Inject
+  public ServiceImpl(
+        A a,  //来自IoC容器
+        B b,  //来自IoC容器
+        C c,  //手动传进去
+        D d   //手动传进去
+        );
+  }
+  ...
+}
+----
+
+要解决这个问题，可以暴露IoC容器中获取实例的接口，并且提供可以接收额外参数的方法，不过这种方法难以保证类型安全。
+
+还有一种用法是自动生成 `ServiceImpl`的Factory类，create（）方法中只需要接收手动传的参数，另外的参数注入即可。这种方式比较优雅，但是实现难度也相对较大。
+
+==== 泛型支持
+
+如果我想注入的成员变量是带参数化类型的，那么就需要泛型支持。
+
+[source,java]
+----
+class Example {
+  @Inject
+  List<String> list;
+}
+----
+
+由于泛型擦除，想要在运行时区分 `List<String>` 和 `List<Integer>` 并不容易，更何况还要处理泛型嵌套和泛型通配符。
+
+NOTE: 参数化类型、类型变量、泛型通配符、泛型擦除相关概念请自行学习。
+
+==== 值注入
+
+值注入是指将配置文件中的值通过注解的形式注入到类的成员变量中，例如：
+
+[source,java]
+----
+@Value("http://${my.host}:${my.port}")
+URL url;
+----
+
+可以将如下配置文件注入到成员变量中：
+[source,yml]
+----
+my:
+  host:127.0.0.1
+  port:80
+----
+
+这个功能非常实用，可以减少大量的样板代码，同时为多版本发布打下了基础。值注入本身实现不复杂，但是类型转换相关的内容比较繁琐。对于这一块的考虑是先实现一个配置注入框架，后续类型转换规则的添加就可以交给好几个人同时完成。
+
+除此之外，配置的热更新有一定难度。
+
+==== Lazy Init、Eager Init
+
+Eager Init 顾名思义是在初始化IoC容器的时候就将Bean实例化。Lazy Init则可以大致分为两种，第一种是需要被注入的时候才实例化，可以通过@Lazy来标识：
+
+[source,java]
+----
+@Lazy
+public class ServiceImpl implements Service {
+  ...
+}
+----
+
+第二种则是使用的时候才实例化，通常这个功能是由``Provider``接口来实现，例如：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  @Inject
+  private final Provider<Repository> repoProvider;
+
+  @Inject
+  private final Provider<Writer> writerProvider;
+
+  boolean upload(MetaData metaData, File file) {
+    final Repository repo = repoProvider.get();
+    final Writer writer = writerProvider.get();
+
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+
+如果是注入期懒加载，那么若一个构建树上存在一个节点，其初始化方式为Eager Init，那么这个节点的所有子节点都会被同化为Eager Init。但如果是使用时才初始化则不会有上述问题，也就是说这种方式可以将初始化推迟的更彻底。
+
+==== 处理环形依赖
+
+依赖分为 *弱依赖* 和 *强依赖* ，如果A通过构造器注入到B中，那么说B强依赖于A。如果通过Setter方法注入则是弱依赖。
+
+如果A依赖于B，且B依赖于C，C依赖于A，那么称A、B、C之间存在 *环形依赖* 。
+
+如果环形依赖是 *弱依赖*，那么环是可以打破的，否则会形成死锁或空指针。
+
+二期中对于环形依赖的考虑是，只要是环形依赖，不管强弱一律不允许 *编译*。
+
+NOTE: 大部分框架对环形依赖的处理是在运行期而不是编译期。
+
+
+==== Lifecycle
+
+===== Lifecycle Callback
+
+Bean 生命周期回调可以简单的理解为在Bean实例被创造之后和销毁之前调用的回调方法，通过 ``@PostConstruct`` 和 ``@PreDestroy``来标识，例如：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  private boolean initialized = false; 
+
+  @PostConstruct 
+  public void initialize() {
+      this.initialized = true;
+  }
+}
+----
+
+这两个功能目前看来作用不大，但是需要留出实现的余地。
+
+===== Lifecycle Listener
+
+生命周期监听器是指可以感知某个Bean的生命周期的能力，这个功能的实现基本都是实现一个接口，就像Spring中的Aware系列和Micronaut中的 ``BeanInitializedEventListener``和``BeanCreatedEventListener``。这些方式有两个相同的问题，一是一个接口一个方法，比较冗余。估计作者的目的是为了避免向接口数组中添加空实现，但是我有个特殊的技巧可以避免这个问题。二是他们都无法感知Bean的注册或注销，故我们的Listener接口可以长这样：
+
+[source,java]
+----
+public interface BeanListener<T> {
+
+    void onInstantiate() throws BeansException;
+
+    T onInitialized() throws BeansException;
+
+    void onRegister();
+
+    void onDeregister();
+
+}
+----
+
+目前这个接口仅作为一个例子，接口内容需要谨慎设计。
+
+NOTE: Bean实例的销毁也是生命周期中的一部分，但是确实没必要感知Bean实例的销毁，Java的``finalize()``方法提供了该功能。
+
+==== Bean 校验
+
+Bean校验也有一套完整的标准， https://beanvalidation.org/2.0/spec/[Jakarta Bean Validation specification]。大体内容是通过注解来校验Bean的属性的值，例如：
+
+[source,java]
+----
+public class Person {
+    private String name;
+
+    @Min(18)
+    private int age;
+
+    @NotBlank
+    public String getName() {
+        return name;
+    }
+}
+----
+
+Bean 校验非常复杂，且业务复杂到一定地步之前作用不大，前期不予考虑。二期完整发布后可以考虑作为增强功能逐步实现。
+
+==== 关于继承的思考
+
+继承是非常常见的操作，但是在依赖注入中会引发很多问题：
+
+* 类型问题
+
+假设有接口A，B实现A，C继承B，D继承C，``@Named``注解打在D上面，那么实现类型D和哪个目标类型绑定？显而易见这里有两个实现方式，一个是显示指定目标类型（多数框架的实现），二个是全都绑上（CDI标准）。
+
+这里我个人觉得还是显示指定类型比较好，毕竟实现比较简单，而且继承本身也不能乱用。
+
+* 代码生成的难度
+
+如果注入的成员变量在父类，而子类没有任何注入的成员变量，那么子类就不会触发注解处理器，也就没机会修改其语法树。这样一来父类中生成额外的构造器，就会导致子类编译失败。这个问题目前还没想到很傻瓜化的解决办法（或者需要付出较大的代价，可能导致编译时间超级加倍），只有使用时额外向子类添加注解来实现。
+
+==== 关于 Stateful/Stateless Bean
+
+对于无状态的Bean，直接将其实例当做单例或者ThreadLocal来处理即可。但是有状态的Bean处理起来就较为复杂。对于用户使用来说，直接提供一个``Refreshable``接口即可，但是对框架实现来说，这个``Refreshable``接口啥时候调用？
+
+这里我的思路是提供一些内建刷新点，比如接受Http请求之前，建立Http连接之前等等。除此之外，再提供一个类似于``Provider``的功能，即每次获取的时候刷新。如果这些都无法满足需求，就只能去实现方法注入了。
+
+==== 暂定的缺陷
+
+缺陷需要慎重考虑，若列为缺陷，初期在设计上就不会考虑这些功能，以减轻复杂度。但是万一后面又需要这些功能，那么再实现会需要较大的代价。
+
+* 无法注入内部类。
+
+想要注入内部类的实例会造成额外的复杂度，而且该功能确实没啥用。
+
+* 无法打破弱循环依赖。
+
+禁止此功能可以将注入点统一到构造器注入。缺点是不能无脑的堆代码，出现循环依赖必须重新设计代码结构（也算是个优点吧）。
+
+* 不同的Bean不能拥有同样的实现。
+
+如果一个实现类型有多个对应的Bean，那么就无法使用基于注解的配置而必须使用配置文件。
+
+== 总结
+
+=== Bean 应该包含的属性
+
+==== 检索
+首先，Bean应该拥有一个唯一的``Id``或者``Name``，用于唯一确定一个Bean。这个``Id``可以理解为主键。其次，一个Bean会有一个或多个``Type``，以及一个或多个``Qualifier``。``Type``和``Qualifier``可以理解为两个索引，也就是说可以通过这两个属性来检索出一系列Bean。但是，``Type`` + ``Qualifier`` 则是唯一组合索引，只能检索出唯一的Bean。
+
+==== 实例化
+要实例化一个Bean，首先就得知道这个Bean依赖的Bean，所以``Dependency``是一个必须的属性。然后，需要有一个``Provider``去实际的执行实例化操作。最后，``Scope``决定了什么时候实例化，什么时候复用之前的实例，即执行实例化操作的时机。
+
+==== 回调
+回调包括自身的生命周期回调和其余Bean注册的回调，这两种可以统一到``Lifecycle``属性中。
+
+== 未完待续
+这篇文档主要讨论了一个接口一个实现的情况，下一篇会集中讨论一个接口多个实现的情况。
+
+
+

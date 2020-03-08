@@ -1,0 +1,87 @@
+= 依赖注入
+
+== 前言
+上一篇主要讨论了单一实现的情况，这篇主要讨论多实现。
+
+解决多实现问题最直接的想法就是基于XML的依赖注入，其灵活性是最强大的。但是由于可维护性、生态缺失等原因，此处不考虑基于XML的依赖注入。
+
+== Qualifier
+
+上文说过，``Type``和``Qualifier``组成的组合索引可以唯一确定一个Bean。在注入依赖时，类型信息以及有了，那么只需要再加上``Qualifier``就能完成Bean的选择。举个例子，依然是``UploadService``
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  @Inject
+  private final Repository repo;
+
+  @Inject
+  private final Writer writer;
+
+  boolean upload(MetaData metaData, File file) {
+    
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+
+在上一篇中这样注入没问题，因为``Repository``和``Writer``都只有一个实现，但是现在我要写单元测试了，新增了``MockRepository``和``MockWriter``实现，这样就无法确认要注入的Bean。这个时候，我可以给两种实现分别加上限定符：
+
+[source,java]
+----
+@UnitTest
+public class MockRepository implements Repository {
+
+  boolean write(MetaData metaData) {
+    return true;
+  }
+}
+----
+
+[source,java]
+----
+@Product
+public class MockRepository implements Repository {
+    
+  boolean write(MetaData metaData) {
+    return true;
+  }
+}
+----
+
+然后修改注入点：
+
+[source,java]
+----
+public class RealUploadService implements UploadService {
+
+  @Inject @Product                     // <1>
+  private final Repository repo;
+
+  @Inject @Product                    
+  private final Writer writer;
+
+  boolean upload(MetaData metaData, File file) {
+    
+    //business logic...
+    
+    return writer.write(file) && repo.write(metaData);
+  }
+}
+----
+<1> 新增限定符注解。
+
+即可完成正确的依赖注入。
+
+== Profiler
+现在生成环境可以正常注入了，但是测试怎么写？我需要把所有的``@Product``注解换成``@UnitTest``注解，然后才能测试，测试完毕后还要换回去，这是不是太麻烦了？
+
+NOTE: 这里举这个例子只是方便理解，其实还能通过``Mock``和``Stub``完成单元测试，具体操作自行阅读单元测试相关书籍。
+
+现在，我希望能不修改代码，仅通过编译时的一些参数，就能完成所有的或者 *部分* Bean的替换，所以这里引入``Profiler``的概念。
+
+``Profiler``代表了一组Bean，
+
